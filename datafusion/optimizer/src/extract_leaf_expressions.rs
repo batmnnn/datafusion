@@ -73,9 +73,10 @@ use std::sync::Arc;
 
 use datafusion_common::alias::AliasGenerator;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion_common::{Column, DFSchema, Result, qualified_name};
+use datafusion_common::{Column, DFSchema, Result, TableReference, qualified_name};
+use datafusion_expr::expr::GroupingSet;
 use datafusion_expr::logical_plan::LogicalPlan;
-use datafusion_expr::{Expr, ExpressionPlacement, Projection};
+use datafusion_expr::{Aggregate, Expr, ExpressionPlacement, Projection, Window};
 
 use crate::optimizer::ApplyOrder;
 use crate::push_down_filter::replace_cols_by_name;
@@ -873,7 +874,10 @@ impl OptimizerRule for PushDownLeafProjections {
     }
 
     fn apply_order(&self) -> Option<ApplyOrder> {
-        Some(ApplyOrder::TopDown)
+        // The rule walks the plan itself. It pushes a projection before that
+        // projection's inputs, then qualifies extracted columns after the
+        // inputs have been pushed. One `ApplyOrder` cannot do both.
+        None
     }
 
     fn rewrite(
@@ -884,12 +888,398 @@ impl OptimizerRule for PushDownLeafProjections {
         if !config.options().optimizer.enable_leaf_expression_pushdown {
             return Ok(Transformed::no(plan));
         }
-        let alias_generator = config.alias_generator();
-        match try_push_input(&plan, alias_generator)? {
-            Some(new_plan) => Ok(Transformed::yes(new_plan)),
-            None => Ok(Transformed::no(plan)),
+        push_then_qualify(plan, config.alias_generator())
+    }
+}
+
+/// Pushes extraction projections top-down, then qualifies extracted columns
+/// on the way back up.
+///
+/// Qualifying on the way up is required. The push moves the defining
+/// projection under a `SubqueryAlias`, and only then does the parent input
+/// schema hold `alias.__datafusion_extracted_N`.
+#[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+fn push_then_qualify(
+    plan: LogicalPlan,
+    alias_generator: &Arc<AliasGenerator>,
+) -> Result<Transformed<LogicalPlan>> {
+    let pushed = match try_push_input(&plan, alias_generator)? {
+        Some(pushed) => Transformed::yes(pushed),
+        None => Transformed::no(plan),
+    };
+
+    // Match `rewrite_plan_in_place`: a child whose schema changed makes this
+    // node's cached schema stale. Recompute it before qualifying, so the
+    // aliases below freeze the names the parent already sees.
+    let mut child_schema_changed = false;
+    let rewritten = pushed.transform_data(|plan| {
+        plan.map_subqueries(|child| push_then_qualify(child, alias_generator))?
+            .transform_data(|plan| {
+                plan.map_children(|child| {
+                    let old_schema = Arc::clone(child.schema());
+                    let child = push_then_qualify(child, alias_generator)?;
+                    if old_schema.as_ref() != child.data.schema().as_ref() {
+                        child_schema_changed = true;
+                    }
+                    Ok(child)
+                })
+            })
+    })?;
+
+    let plan = if child_schema_changed {
+        rewritten.data.recompute_schema()?
+    } else {
+        rewritten.data
+    };
+    let qualified = qualify_extracted_columns(plan)?;
+    Ok(Transformed::new_transformed(
+        qualified.data,
+        rewritten.transformed || child_schema_changed || qualified.transformed,
+    ))
+}
+
+/// Rewrites an unqualified `__datafusion_extracted_N` column to the single
+/// qualified column of that name on the input schema.
+///
+/// `SubqueryAlias` qualifies every output field. Pass 2 moves the extraction
+/// projection under the alias and leaves the parent column unqualified. The
+/// unqualified form still resolves, but its text is part of an aggregate or
+/// window output name. Rebuilding that node with column normalization (what
+/// `LogicalPlanBuilder::aggregate` does) qualifies the column, changes the
+/// output name, and the projection above no longer resolves.
+///
+/// The rewrite uses the qualifier from the input field. When that changes the
+/// output field name, the expression is aliased back to the previous name so
+/// parents keep resolving.
+fn qualify_extracted_columns(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+    if !has_unqualified_extracted_column(&plan) {
+        return Ok(Transformed::no(plan));
+    }
+    let spellings = extracted_column_spellings(&plan);
+    if spellings.is_empty() {
+        return Ok(Transformed::no(plan));
+    }
+    let Some(rewritten) = rewrite_extracted_columns(&plan.expressions(), &spellings)?
+    else {
+        return Ok(Transformed::no(plan));
+    };
+    let Some(exprs) = align_output_exprs(&plan, rewritten)? else {
+        return Ok(Transformed::no(plan));
+    };
+    let inputs = plan.inputs().into_iter().cloned().collect();
+    let new_plan = plan.with_new_exprs(exprs, inputs)?;
+    if same_field_identity(plan.schema(), new_plan.schema()) {
+        Ok(Transformed::yes(new_plan))
+    } else {
+        // The output name could not be preserved. Leave the node unchanged
+        // so a parent projection does not lose its column.
+        Ok(Transformed::no(plan))
+    }
+}
+
+/// Returns true when `plan` references an unqualified extracted column.
+fn has_unqualified_extracted_column(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    let _ = plan.apply_expressions(|expr| {
+        if found {
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        expr.apply(|e| {
+            if matches!(
+                e,
+                Expr::Column(col)
+                    if col.relation.is_none()
+                        && col.name.starts_with(EXTRACTED_EXPR_PREFIX)
+            ) {
+                found = true;
+                Ok(TreeNodeRecursion::Stop)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        })
+    });
+    found
+}
+
+/// Maps each extracted name to the one qualified input column of that name.
+///
+/// A name with no qualifier, or with more than one input column, is omitted.
+/// Qualifying an ambiguous name is wrong, and an unqualified field is already
+/// spelled the way the input schema holds it.
+fn extracted_column_spellings(plan: &LogicalPlan) -> HashMap<String, Column> {
+    let mut found: HashMap<String, Option<Column>> = HashMap::new();
+    for input in plan.inputs() {
+        for (qualifier, field) in input.schema().iter() {
+            let name = field.name();
+            if !name.starts_with(EXTRACTED_EXPR_PREFIX) {
+                continue;
+            }
+            let column = Column::new(qualifier.cloned(), name);
+            found
+                .entry(name.clone())
+                .and_modify(|slot| {
+                    if slot.as_ref() != Some(&column) {
+                        *slot = None;
+                    }
+                })
+                .or_insert_with(|| Some(column));
         }
     }
+    found
+        .into_iter()
+        .filter_map(|(name, column)| match column {
+            Some(column) if column.relation.is_some() => Some((name, column)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Replaces unqualified extracted columns. Returns `None` when nothing changed.
+fn rewrite_extracted_columns(
+    exprs: &[Expr],
+    spellings: &HashMap<String, Column>,
+) -> Result<Option<Vec<Expr>>> {
+    let mut changed = false;
+    let mut rewritten = Vec::with_capacity(exprs.len());
+    for expr in exprs {
+        let transformed = expr.clone().transform(|e| {
+            let Expr::Column(col) = &e else {
+                return Ok(Transformed::no(e));
+            };
+            if col.relation.is_some() {
+                return Ok(Transformed::no(e));
+            }
+            let Some(qualified) = spellings.get(&col.name) else {
+                return Ok(Transformed::no(e));
+            };
+            changed = true;
+            Ok(Transformed::yes(Expr::Column(
+                qualified.clone().with_spans(col.spans().clone()),
+            )))
+        })?;
+        rewritten.push(transformed.data);
+    }
+    Ok(changed.then_some(rewritten))
+}
+
+/// Aliases schema-defining expressions so output fields keep their names.
+///
+/// Returns `None` when the field list does not line up with the expressions.
+/// The caller then leaves the node unchanged.
+fn align_output_exprs(
+    plan: &LogicalPlan,
+    rewritten: Vec<Expr>,
+) -> Result<Option<Vec<Expr>>> {
+    match plan {
+        LogicalPlan::Projection(Projection { expr, schema, .. }) => {
+            if rewritten.len() != expr.len() || expr.len() != schema.fields().len() {
+                return Ok(None);
+            }
+            Ok(Some(align_to_fields(rewritten, schema, 0)))
+        }
+        LogicalPlan::Window(Window {
+            input,
+            window_expr,
+            schema,
+        }) => {
+            let input_len = input.schema().fields().len();
+            if rewritten.len() != window_expr.len()
+                || schema.fields().len() != input_len + window_expr.len()
+                || !input_fields_match(input.schema(), schema)
+            {
+                return Ok(None);
+            }
+            Ok(Some(align_to_fields(rewritten, schema, input_len)))
+        }
+        LogicalPlan::Aggregate(Aggregate {
+            group_expr,
+            aggr_expr,
+            schema,
+            ..
+        }) => align_aggregate_exprs(group_expr, aggr_expr, schema, rewritten),
+        _ => Ok(Some(rewritten)),
+    }
+}
+
+/// Returns true when `input`'s fields are the leading fields of `output`.
+fn input_fields_match(input: &DFSchema, output: &DFSchema) -> bool {
+    input.fields().len() <= output.fields().len()
+        && input
+            .iter()
+            .zip(output.iter())
+            .all(|((in_q, in_f), (out_q, out_f))| {
+                in_q == out_q
+                    && in_f.name() == out_f.name()
+                    && in_f.data_type() == out_f.data_type()
+                    && in_f.is_nullable() == out_f.is_nullable()
+            })
+}
+
+/// Aliases `exprs` to the fields of `schema` starting at `offset`.
+fn align_to_fields(exprs: Vec<Expr>, schema: &DFSchema, offset: usize) -> Vec<Expr> {
+    exprs
+        .into_iter()
+        .enumerate()
+        .map(|(i, expr)| {
+            let (qualifier, field) = schema.qualified_field(offset + i);
+            alias_to_field(expr, qualifier, field.name())
+        })
+        .collect()
+}
+
+/// Keeps aggregate output fields aligned with `schema` after column qualification.
+///
+/// Group keys are deduplicated in first-seen order, matching
+/// `grouping_set_to_exprlist`. Every copy of one key gets the same alias so
+/// the dedup still removes it. A mixed grouping-set list is left alone:
+/// `enumerate_grouping_sets` rewrites that list and the field order is not
+/// the order of the original expressions.
+fn align_aggregate_exprs(
+    group_expr: &[Expr],
+    aggr_expr: &[Expr],
+    schema: &DFSchema,
+    mut rewritten: Vec<Expr>,
+) -> Result<Option<Vec<Expr>>> {
+    if rewritten.len() != group_expr.len() + aggr_expr.len() {
+        return Ok(None);
+    }
+    let new_aggr = rewritten.split_off(group_expr.len());
+    let new_group = rewritten;
+
+    if matches!(new_group.as_slice(), [Expr::GroupingSet(_)]) {
+        return Ok(align_grouping_set(&new_group[0], &new_aggr, schema));
+    }
+    if new_group
+        .iter()
+        .any(|expr| matches!(expr, Expr::GroupingSet(_)))
+    {
+        return Ok(None);
+    }
+
+    let mut distinct: Vec<Expr> = Vec::new();
+    for expr in &new_group {
+        if !distinct.contains(expr) {
+            distinct.push(expr.clone());
+        }
+    }
+    if schema.fields().len() != distinct.len() + new_aggr.len() {
+        return Ok(None);
+    }
+
+    let aliased_distinct: Vec<Expr> = distinct
+        .iter()
+        .enumerate()
+        .map(|(i, expr)| {
+            let (qualifier, field) = schema.qualified_field(i);
+            alias_to_field(expr.clone(), qualifier, field.name())
+        })
+        .collect();
+    let group_count = distinct.len();
+    let mut aligned: Vec<Expr> = new_group
+        .into_iter()
+        .map(|expr| {
+            let index = distinct.iter().position(|item| item == &expr);
+            match index {
+                Some(index) => aliased_distinct[index].clone(),
+                None => expr,
+            }
+        })
+        .collect();
+    aligned.extend(new_aggr.into_iter().enumerate().map(|(i, expr)| {
+        let (qualifier, field) = schema.qualified_field(group_count + i);
+        alias_to_field(expr, qualifier, field.name())
+    }));
+    Ok(Some(aligned))
+}
+
+/// Aliases the distinct expressions of a single grouping set.
+///
+/// Output fields are the distinct expressions, then `__grouping_id`, then the
+/// aggregate expressions. Returns `None` when that layout does not match
+/// `schema`.
+fn align_grouping_set(
+    group_expr: &Expr,
+    aggr_expr: &[Expr],
+    schema: &DFSchema,
+) -> Option<Vec<Expr>> {
+    let Expr::GroupingSet(grouping_set) = group_expr else {
+        return None;
+    };
+    let distinct = grouping_set.distinct_expr();
+    let id_index = distinct.len();
+    if schema.fields().len() != id_index + 1 + aggr_expr.len() {
+        return None;
+    }
+    let (_, id_field) = schema.qualified_field(id_index);
+    if id_field.name() != Aggregate::INTERNAL_GROUPING_ID {
+        return None;
+    }
+
+    let aliased: Vec<(Expr, Expr)> = distinct
+        .into_iter()
+        .enumerate()
+        .map(|(i, expr)| {
+            let (qualifier, field) = schema.qualified_field(i);
+            (
+                expr.clone(),
+                alias_to_field(expr.clone(), qualifier, field.name()),
+            )
+        })
+        .collect();
+    let mut aligned = vec![Expr::GroupingSet(map_grouping_set(grouping_set, &aliased))];
+    let aggr_offset = id_index + 1;
+    aligned.extend(aggr_expr.iter().enumerate().map(|(i, expr)| {
+        let (qualifier, field) = schema.qualified_field(aggr_offset + i);
+        alias_to_field(expr.clone(), qualifier, field.name())
+    }));
+    Some(aligned)
+}
+
+/// Replaces grouping-set expressions that were aliased for a stable output name.
+fn map_grouping_set(grouping_set: &GroupingSet, aliased: &[(Expr, Expr)]) -> GroupingSet {
+    let replace = |expr: &Expr| {
+        aliased
+            .iter()
+            .find(|(from, _)| from == expr)
+            .map(|(_, to)| to.clone())
+            .unwrap_or_else(|| expr.clone())
+    };
+    match grouping_set {
+        GroupingSet::Rollup(exprs) => {
+            GroupingSet::Rollup(exprs.iter().map(replace).collect())
+        }
+        GroupingSet::Cube(exprs) => {
+            GroupingSet::Cube(exprs.iter().map(replace).collect())
+        }
+        GroupingSet::GroupingSets(groups) => GroupingSet::GroupingSets(
+            groups
+                .iter()
+                .map(|group| group.iter().map(replace).collect())
+                .collect(),
+        ),
+    }
+}
+
+/// Returns `expr` when it already produces `(qualifier, name)`.
+/// Otherwise aliases it so the output field keeps that identity.
+fn alias_to_field(expr: Expr, qualifier: Option<&TableReference>, name: &str) -> Expr {
+    let (current_qualifier, current_name) = expr.qualified_name();
+    if current_qualifier.as_ref() == qualifier && current_name == name {
+        expr
+    } else {
+        expr.alias_qualified(qualifier.cloned(), name)
+    }
+}
+
+/// Compares the fields a parent resolves: qualifier, name, type, nullability.
+fn same_field_identity(left: &DFSchema, right: &DFSchema) -> bool {
+    left.fields().len() == right.fields().len()
+        && left.iter().zip(right.iter()).all(|((lq, lf), (rq, rf))| {
+            lq == rq
+                && lf.name() == rf.name()
+                && lf.data_type() == rf.data_type()
+                && lf.is_nullable() == rf.is_nullable()
+        })
 }
 
 /// Attempts to push a projection's extractable expressions further down.
@@ -1466,9 +1856,9 @@ fn try_push_into_inputs(
     let num_inputs = inputs.len();
 
     // Build per-input extraction projections and push them as far as possible
-    // immediately. This is critical because map_children preserves cached schemas,
-    // so if the TopDown pass later pushes a child further (changing its output
-    // schema), the parent node's schema becomes stale.
+    // immediately. This is critical because map_children preserves cached schemas.
+    // The projection is created here, so a later visit does not push it again.
+    // The parent schema must be built from the fully pushed input.
     let mut new_inputs: Vec<LogicalPlan> = Vec::with_capacity(num_inputs);
     let is_union = matches!(node, LogicalPlan::Union(_));
     for (idx, input) in inputs.into_iter().enumerate() {
@@ -1504,8 +1894,9 @@ fn try_push_into_inputs(
             let proj_plan = LogicalPlan::Projection(proj);
             // Try to push the extraction projection further down within
             // this input (e.g., through Filter → existing extraction projection).
-            // This ensures the input's output schema is stable and won't change
-            // when the TopDown pass later visits children.
+            // The parent schema is built here, so the input must already be
+            // fully pushed. `push_then_qualify` visits these children later
+            // and must not move the projection again.
             let pushed = match try_push_input(&proj_plan, alias_generator)? {
                 Some(pushed) => pushed,
                 None => proj_plan,
@@ -3151,7 +3542,7 @@ mod tests {
         (same as original)
 
         ## After Pushdown
-        Projection: sub.id, __datafusion_extracted_1 AS leaf_udf(sub.user,Utf8("name"))
+        Projection: sub.id, sub.__datafusion_extracted_1 AS leaf_udf(sub.user,Utf8("name"))
           SubqueryAlias: sub
             Projection: test.id * UInt32(10) AS id, test.user, __datafusion_extracted_1
               Filter: test.id > UInt32(0)
@@ -3159,7 +3550,7 @@ mod tests {
                   TableScan: test projection=[id, user]
 
         ## Optimized
-        Projection: sub.id, __datafusion_extracted_1 AS leaf_udf(sub.user,Utf8("name"))
+        Projection: sub.id, sub.__datafusion_extracted_1 AS leaf_udf(sub.user,Utf8("name"))
           SubqueryAlias: sub
             Projection: test.id * UInt32(10) AS id, __datafusion_extracted_1
               Filter: test.id > UInt32(0)
@@ -3191,13 +3582,13 @@ mod tests {
         (same as original)
 
         ## After Pushdown
-        Projection: __datafusion_extracted_1 AS leaf_udf(sub.user,Utf8("name"))
+        Projection: sub.__datafusion_extracted_1 AS leaf_udf(sub.user,Utf8("name"))
           SubqueryAlias: sub
             Projection: leaf_udf(test.user, Utf8("name")) AS __datafusion_extracted_1, test.user
               TableScan: test projection=[user]
 
         ## Optimized
-        Projection: __datafusion_extracted_1 AS leaf_udf(sub.user,Utf8("name"))
+        Projection: sub.__datafusion_extracted_1 AS leaf_udf(sub.user,Utf8("name"))
           SubqueryAlias: sub
             Projection: leaf_udf(test.user, Utf8("name")) AS __datafusion_extracted_1
               TableScan: test projection=[user]
@@ -3231,15 +3622,15 @@ mod tests {
 
         ## After Pushdown
         Projection: __datafusion_extracted_2 AS leaf_udf(sub.user,Utf8("name"))
-          Projection: sub.user, __datafusion_extracted_2
-            Filter: __datafusion_extracted_1 = Utf8("active")
+          Projection: sub.user, sub.__datafusion_extracted_2 AS __datafusion_extracted_2
+            Filter: sub.__datafusion_extracted_1 = Utf8("active")
               SubqueryAlias: sub
                 Projection: leaf_udf(test.user, Utf8("status")) AS __datafusion_extracted_1, leaf_udf(test.user, Utf8("name")) AS __datafusion_extracted_2, test.user
                   TableScan: test projection=[user]
 
         ## Optimized
-        Projection: __datafusion_extracted_2 AS leaf_udf(sub.user,Utf8("name"))
-          Filter: __datafusion_extracted_1 = Utf8("active")
+        Projection: sub.__datafusion_extracted_2 AS leaf_udf(sub.user,Utf8("name"))
+          Filter: sub.__datafusion_extracted_1 = Utf8("active")
             SubqueryAlias: sub
               Projection: leaf_udf(test.user, Utf8("status")) AS __datafusion_extracted_1, leaf_udf(test.user, Utf8("name")) AS __datafusion_extracted_2
                 TableScan: test projection=[user]
@@ -3267,19 +3658,111 @@ mod tests {
         (same as original)
 
         ## After Pushdown
-        Projection: __datafusion_extracted_1 AS leaf_udf(outer_sub.user,Utf8("name"))
+        Projection: outer_sub.__datafusion_extracted_1 AS leaf_udf(outer_sub.user,Utf8("name"))
           SubqueryAlias: outer_sub
             SubqueryAlias: inner_sub
               Projection: leaf_udf(test.user, Utf8("name")) AS __datafusion_extracted_1, test.user
                 TableScan: test projection=[user]
 
         ## Optimized
-        Projection: __datafusion_extracted_1 AS leaf_udf(outer_sub.user,Utf8("name"))
+        Projection: outer_sub.__datafusion_extracted_1 AS leaf_udf(outer_sub.user,Utf8("name"))
           SubqueryAlias: outer_sub
             SubqueryAlias: inner_sub
               Projection: leaf_udf(test.user, Utf8("name")) AS __datafusion_extracted_1
                 TableScan: test projection=[user]
         "#)
+    }
+
+    /// An aggregate over a `SubqueryAlias` must spell the extracted column
+    /// with that alias. Rebuilding the aggregate with column normalization
+    /// must keep the output field names (issue #26144).
+    #[test]
+    fn test_aggregate_qualifies_extracted_column_under_subquery_alias() -> Result<()> {
+        use datafusion_expr::test::function_stub::count;
+
+        let table_scan = test_table_scan_with_struct()?;
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .alias("sub")?
+            .aggregate(
+                vec![col("sub.id")],
+                vec![count(leaf_udf(col("sub.user"), "value"))],
+            )?
+            .build()?;
+
+        let optimized = optimize_leaf_rules(plan)?;
+        let rendered = optimized.to_string();
+        assert!(
+            rendered.contains("sub.__datafusion_extracted_"),
+            "extracted column must use the subquery qualifier:\n{rendered}"
+        );
+        assert_aggregate_names_stable_under_normalize(&optimized)
+    }
+
+    /// A filter between the aggregate and the alias must not hide the qualifier.
+    #[test]
+    fn test_aggregate_qualifies_extracted_column_through_filter() -> Result<()> {
+        use datafusion_expr::test::function_stub::count;
+
+        let table_scan = test_table_scan_with_struct()?;
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .alias("sub")?
+            .filter(col("sub.id").gt(lit(0u32)))?
+            .aggregate(
+                vec![col("sub.id")],
+                vec![count(leaf_udf(col("sub.user"), "value"))],
+            )?
+            .build()?;
+
+        let optimized = optimize_leaf_rules(plan)?;
+        let rendered = optimized.to_string();
+        assert!(
+            rendered.contains("sub.__datafusion_extracted_"),
+            "extracted column must stay qualified through the filter:\n{rendered}"
+        );
+        assert_aggregate_names_stable_under_normalize(&optimized)
+    }
+
+    fn optimize_leaf_rules(plan: LogicalPlan) -> Result<LogicalPlan> {
+        let optimizer = Optimizer::with_rules(vec![
+            Arc::new(ExtractLeafExpressions::new()),
+            Arc::new(PushDownLeafProjections::new()),
+            Arc::new(OptimizeProjections::new()),
+        ]);
+        optimizer.optimize(plan, &OptimizerContext::new(), |_, _| {})
+    }
+
+    /// `LogicalPlanBuilder::aggregate` normalizes columns and recomputes the
+    /// schema. The output names must survive that rebuild.
+    fn assert_aggregate_names_stable_under_normalize(plan: &LogicalPlan) -> Result<()> {
+        use datafusion_expr::expr_rewriter::normalize_cols;
+
+        plan.apply(|node| {
+            let LogicalPlan::Aggregate(agg) = node else {
+                return Ok(TreeNodeRecursion::Continue);
+            };
+            let group_expr = normalize_cols(agg.group_expr.clone(), agg.input.as_ref())?;
+            let aggr_expr = normalize_cols(agg.aggr_expr.clone(), agg.input.as_ref())?;
+            let rebuilt =
+                Aggregate::try_new(Arc::clone(&agg.input), group_expr, aggr_expr)?;
+            let old_names: Vec<_> = agg
+                .schema
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect();
+            let new_names: Vec<_> = rebuilt
+                .schema
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect();
+            assert_eq!(
+                old_names, new_names,
+                "aggregate output names changed after normalization:\n{node}"
+            );
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(())
     }
 
     /// Plain columns through SubqueryAlias -- no extraction needed.
@@ -3706,7 +4189,7 @@ mod tests {
         // output schema (`user`, `id`, `__datafusion_extracted_2`) is restored
         // by a recovery projection, so `optimize_projections` succeeds.
         insta::assert_snapshot!(format!("{optimized}"), @r#"
-        Projection: __datafusion_extracted_2 AS leaf_udf(v.user,Utf8("status")), v.user, v.id
+        Projection: v.__datafusion_extracted_2 AS leaf_udf(v.user,Utf8("status")), v.user, v.id
           SubqueryAlias: v
             Projection: test.user, test.id, __datafusion_extracted_2
               Filter: __datafusion_extracted_1 IS NOT NULL

@@ -4101,3 +4101,32 @@ async fn roundtrip_range_partitioning_desc_nulls_last() -> Result<()> {
     assert_eq!(format!("{plan:?}"), format!("{logical_round_trip:?}"));
     Ok(())
 }
+
+/// Leaf pushdown leaves an aggregate argument as an unqualified
+/// `__datafusion_extracted_N` column after the defining projection moves
+/// under a subquery alias. A round trip must keep the aggregate output name
+/// so the projection above still resolves.
+///
+/// See <https://github.com/apache/datafusion/issues/26144>.
+#[tokio::test]
+async fn roundtrip_aggregate_extracted_column_under_subquery_alias() -> Result<()> {
+    let ctx = SessionContext::new();
+    let sql = "WITH t AS (SELECT 'm1' AS id, \
+         [named_struct('name', 'Subject', 'value', 'Hello')] AS headers), \
+         hdr AS (SELECT id, unnest(headers) AS h FROM t) \
+         SELECT id, MAX(CASE WHEN lower(hdr.h['name']) = 'subject' \
+         THEN hdr.h['value'] END) AS subject \
+         FROM hdr GROUP BY id";
+    let plan = ctx.sql(sql).await?.into_optimized_plan()?;
+    let rendered = plan.to_string();
+    assert!(
+        rendered.contains("hdr.__datafusion_extracted_"),
+        "extracted column must use the subquery qualifier:\n{rendered}"
+    );
+
+    let bytes = logical_plan_to_bytes(&plan)?;
+    let round_trip = logical_plan_from_bytes(&bytes, &ctx.task_ctx())?;
+    assert_eq!(plan.schema(), round_trip.schema());
+    assert_eq!(format!("{plan:?}"), format!("{round_trip:?}"));
+    Ok(())
+}

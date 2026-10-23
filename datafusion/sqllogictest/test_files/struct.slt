@@ -1790,7 +1790,7 @@ query TT
 explain select s['b'] from struct_ctor_view where s is not null;
 ----
 logical_plan
-01)Projection: __datafusion_extracted_1 AS struct_ctor_view.s[b]
+01)Projection: struct_ctor_view.__datafusion_extracted_1 AS struct_ctor_view.s[b]
 02)--SubqueryAlias: struct_ctor_view
 03)----Projection: struct_ctor_null.b AS __datafusion_extracted_1
 04)------TableScan: struct_ctor_null projection=[b]
@@ -2006,7 +2006,7 @@ select env, sum(s['a']) from expanded group by env order by env;
 logical_plan
 01)Sort: expanded.env ASC NULLS LAST
 02)--Projection: expanded.env, sum(__datafusion_extracted_1) AS sum(expanded.s[a])
-03)----Aggregate: groupBy=[[expanded.env]], aggr=[[sum(CAST(__datafusion_extracted_1 AS Int64))]]
+03)----Aggregate: groupBy=[[expanded.env]], aggr=[[sum(CAST(expanded.__datafusion_extracted_1 AS Int64)) AS sum(__datafusion_extracted_1)]]
 04)------SubqueryAlias: expanded
 05)--------SubqueryAlias: samples
 06)----------Projection: leaf_merge_source.env, get_field(s, Utf8("a")) AS __datafusion_extracted_1
