@@ -2327,16 +2327,45 @@ logical_plan
 01)Projection: outer_t.id, outer_t.id IN (<subquery>) AS has_matching_label
 02)--Subquery:
 03)----Projection: inner_t.id
-04)------Limit: skip=0, fetch=1
-05)--------Filter: __datafusion_extracted_1 != Utf8("delta")
-06)----------Projection: inner_t.id, inner_t.__datafusion_extracted_1 AS __datafusion_extracted_1
-07)------------SubqueryAlias: inner_t
-08)--------------Projection: simple_struct.id, simple_struct.s, __datafusion_extracted_1
-09)----------------Filter: simple_struct.id = outer_ref(outer_t.id) AND __datafusion_extracted_2 > Int64(120)
-10)------------------Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_2, simple_struct.id, simple_struct.s, get_field(simple_struct.s, Utf8("label")) AS __datafusion_extracted_1
-11)--------------------TableScan: simple_struct, partial_filters=[simple_struct.id = outer_ref(outer_t.id), get_field(simple_struct.s, Utf8("value")) > Int64(120)]
-12)--SubqueryAlias: outer_t
-13)----TableScan: simple_struct projection=[id]
+04)------Projection: inner_t.id, inner_t.__datafusion_extracted_1
+05)--------SubqueryAlias: inner_t
+06)----------Projection: simple_struct.id, simple_struct.s, __datafusion_extracted_1
+07)------------Limit: skip=0, fetch=1
+08)--------------Filter: simple_struct.id = outer_ref(outer_t.id) AND __datafusion_extracted_2 > Int64(120) AND __datafusion_extracted_1 != Utf8("delta")
+09)----------------Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_2, simple_struct.id, simple_struct.s, get_field(simple_struct.s, Utf8("label")) AS __datafusion_extracted_1
+10)------------------TableScan: simple_struct, partial_filters=[simple_struct.id = outer_ref(outer_t.id), get_field(simple_struct.s, Utf8("value")) > Int64(120)]
+11)--SubqueryAlias: outer_t
+12)----TableScan: simple_struct projection=[id]
+
+# The IN subquery above has no physical plan. This derived table uses the same
+# filters. Rows with s['value'] > 120 are ids 2, 3, 4 and 5. The label filter
+# removes id 4 (delta). Three rows remain. ORDER BY value DESC LIMIT 1 returns
+# id 5. A limit placed before the label filter, ordered by value, would return
+# id 4.
+
+query I
+SELECT count(*)
+FROM (
+    SELECT id, s['label'] AS __datafusion_extracted_1
+    FROM simple_struct
+    WHERE s['value'] > 120
+) t
+WHERE __datafusion_extracted_1 <> 'delta';
+----
+3
+
+query I
+SELECT id
+FROM (
+    SELECT id, s['value'] AS value, s['label'] AS __datafusion_extracted_1
+    FROM simple_struct
+    WHERE s['value'] > 120
+) t
+WHERE __datafusion_extracted_1 <> 'delta'
+ORDER BY value DESC
+LIMIT 1;
+----
+5
 
 statement ok
 set datafusion.explain.logical_plan_only = false;
