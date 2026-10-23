@@ -4101,3 +4101,92 @@ async fn roundtrip_range_partitioning_desc_nulls_last() -> Result<()> {
     assert_eq!(format!("{plan:?}"), format!("{logical_round_trip:?}"));
     Ok(())
 }
+
+/// Leaf pushdown leaves an aggregate argument as an unqualified
+/// `__datafusion_extracted_N` column after the defining projection moves
+/// under a subquery alias. A round trip must keep the aggregate output name
+/// so the projection above still resolves.
+///
+/// See <https://github.com/apache/datafusion/issues/26144>.
+#[tokio::test]
+async fn roundtrip_aggregate_extracted_column_under_subquery_alias() -> Result<()> {
+    let ctx = SessionContext::new();
+    let sql = "WITH t AS (SELECT 'm1' AS id, \
+         [named_struct('name', 'Subject', 'value', 'Hello')] AS headers), \
+         hdr AS (SELECT id, unnest(headers) AS h FROM t) \
+         SELECT id, MAX(CASE WHEN lower(hdr.h['name']) = 'subject' \
+         THEN hdr.h['value'] END) AS subject \
+         FROM hdr GROUP BY id";
+    let plan = ctx.sql(sql).await?.into_optimized_plan()?;
+    let rendered = plan.to_string();
+    assert!(
+        rendered.contains("hdr.__datafusion_extracted_"),
+        "extracted column must use the subquery qualifier:\n{rendered}"
+    );
+
+    let bytes = logical_plan_to_bytes(&plan)?;
+    let round_trip = logical_plan_from_bytes(&bytes, &ctx.task_ctx())?;
+    assert_eq!(plan.schema(), round_trip.schema());
+    assert_eq!(format!("{plan:?}"), format!("{round_trip:?}"));
+    Ok(())
+}
+
+/// The same extracted name on both sides of a join is qualified per `ON` key.
+/// A filter that can see both inputs stays unqualified. `normalize_cols`
+/// rejects that filter, so a round trip must not pick a side for it.
+#[tokio::test]
+async fn roundtrip_join_same_extracted_name_on_both_sides() -> Result<()> {
+    use datafusion::optimizer::OptimizerContext;
+    use datafusion::optimizer::extract_leaf_expressions::PushDownLeafProjections;
+    use datafusion_common::NullEquality;
+    use datafusion_expr::JoinType;
+    use datafusion_expr::logical_plan::{Join, JoinConstraint};
+
+    let ctx = SessionContext::new();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("__datafusion_extracted_1", DataType::Int32, true),
+        Field::new("id", DataType::Int32, true),
+    ]));
+    ctx.register_table("left_src", Arc::new(EmptyTable::new(Arc::clone(&schema))))?;
+    ctx.register_table("right_src", Arc::new(EmptyTable::new(schema)))?;
+
+    let left =
+        LogicalPlanBuilder::from(ctx.table("left_src").await?.into_optimized_plan()?)
+            .alias("l")?
+            .build()?;
+    let right =
+        LogicalPlanBuilder::from(ctx.table("right_src").await?.into_optimized_plan()?)
+            .alias("r")?
+            .build()?;
+    let plan = LogicalPlan::Join(Join::try_new(
+        Arc::new(left),
+        Arc::new(right),
+        vec![(
+            col("__datafusion_extracted_1"),
+            col("__datafusion_extracted_1"),
+        )],
+        Some(col("__datafusion_extracted_1").is_not_null()),
+        JoinType::Inner,
+        JoinConstraint::On,
+        NullEquality::NullEqualsNothing,
+        false,
+    )?);
+
+    let optimized = Optimizer::with_rules(vec![Arc::new(PushDownLeafProjections::new())])
+        .optimize(plan, &OptimizerContext::new(), |_, _| {})?;
+    let rendered = optimized.to_string();
+    assert!(
+        rendered.contains("l.__datafusion_extracted_1 = r.__datafusion_extracted_1"),
+        "each join key must use its own input:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Filter: __datafusion_extracted_1 IS NOT NULL"),
+        "an ambiguous filter must stay unqualified:\n{rendered}"
+    );
+
+    let bytes = logical_plan_to_bytes(&optimized)?;
+    let round_trip = logical_plan_from_bytes(&bytes, &ctx.task_ctx())?;
+    assert_eq!(optimized.schema(), round_trip.schema());
+    assert_eq!(format!("{optimized:?}"), format!("{round_trip:?}"));
+    Ok(())
+}

@@ -1659,7 +1659,7 @@ query TT
 EXPLAIN SELECT t.s['value'] FROM (SELECT * FROM simple_struct) t WHERE t.id > 2;
 ----
 logical_plan
-01)Projection: __datafusion_extracted_1 AS t.s[value]
+01)Projection: t.__datafusion_extracted_1 AS t.s[value]
 02)--SubqueryAlias: t
 03)----Projection: __datafusion_extracted_1
 04)------Filter: simple_struct.id > Int64(2)
@@ -1684,7 +1684,7 @@ EXPLAIN SELECT t.s['value'], t.s['label'] FROM (SELECT * FROM simple_struct) t O
 ----
 logical_plan
 01)Sort: t.s[value] ASC NULLS LAST
-02)--Projection: __datafusion_extracted_1 AS t.s[value], __datafusion_extracted_2 AS t.s[label]
+02)--Projection: t.__datafusion_extracted_1 AS t.s[value], t.__datafusion_extracted_2 AS t.s[label]
 03)----SubqueryAlias: t
 04)------Projection: get_field(simple_struct.s, Utf8("value")) AS __datafusion_extracted_1, get_field(simple_struct.s, Utf8("label")) AS __datafusion_extracted_2
 05)--------TableScan: simple_struct projection=[s]
@@ -1708,7 +1708,7 @@ query TT
 EXPLAIN SELECT u.s['value'] FROM (SELECT * FROM (SELECT * FROM simple_struct) t) u WHERE u.id > 2;
 ----
 logical_plan
-01)Projection: __datafusion_extracted_1 AS u.s[value]
+01)Projection: u.__datafusion_extracted_1 AS u.s[value]
 02)--SubqueryAlias: u
 03)----SubqueryAlias: t
 04)------Projection: __datafusion_extracted_1
@@ -1762,7 +1762,7 @@ EXPLAIN SELECT s['value'] FROM (
 ) t;
 ----
 logical_plan
-01)Projection: __datafusion_extracted_1 AS t.s[value]
+01)Projection: t.__datafusion_extracted_1 AS t.s[value]
 02)--SubqueryAlias: t
 03)----Union
 04)------Projection: __datafusion_extracted_1
@@ -1805,7 +1805,7 @@ EXPLAIN SELECT s['value'], s['label'] FROM (
 ----
 logical_plan
 01)Sort: t.s[value] ASC NULLS LAST
-02)--Projection: __datafusion_extracted_1 AS t.s[value], __datafusion_extracted_2 AS t.s[label]
+02)--Projection: t.__datafusion_extracted_1 AS t.s[value], t.__datafusion_extracted_2 AS t.s[label]
 03)----SubqueryAlias: t
 04)------Union
 05)--------Projection: __datafusion_extracted_1, __datafusion_extracted_2
@@ -1890,8 +1890,8 @@ INNER JOIN simple_struct s ON s.id = j.id
 WHERE s.s['value'] > j.s['level'];
 ----
 logical_plan
-01)Projection: __datafusion_extracted_3 AS s.s[value], __datafusion_extracted_4 AS j.s[role]
-02)--Inner Join: j.id = s.id Filter: __datafusion_extracted_1 > __datafusion_extracted_2
+01)Projection: s.__datafusion_extracted_3 AS s.s[value], j.__datafusion_extracted_4 AS j.s[role]
+02)--Inner Join: j.id = s.id Filter: s.__datafusion_extracted_1 > j.__datafusion_extracted_2
 03)----SubqueryAlias: j
 04)------Projection: get_field(join_right.s, Utf8("level")) AS __datafusion_extracted_2, get_field(join_right.s, Utf8("role")) AS __datafusion_extracted_4, join_right.id
 05)--------TableScan: join_right projection=[id, s]
@@ -2327,7 +2327,7 @@ logical_plan
 01)Projection: outer_t.id, outer_t.id IN (<subquery>) AS has_matching_label
 02)--Subquery:
 03)----Projection: inner_t.id
-04)------Projection: inner_t.id, __datafusion_extracted_1
+04)------Projection: inner_t.id, inner_t.__datafusion_extracted_1
 05)--------SubqueryAlias: inner_t
 06)----------Projection: simple_struct.id, simple_struct.s, __datafusion_extracted_1
 07)------------Limit: skip=0, fetch=1
@@ -2336,6 +2336,36 @@ logical_plan
 10)------------------TableScan: simple_struct, partial_filters=[simple_struct.id = outer_ref(outer_t.id), get_field(simple_struct.s, Utf8("value")) > Int64(120)]
 11)--SubqueryAlias: outer_t
 12)----TableScan: simple_struct projection=[id]
+
+# The IN subquery above has no physical plan. This derived table uses the same
+# filters. Rows with s['value'] > 120 are ids 2, 3, 4 and 5. The label filter
+# removes id 4 (delta). Three rows remain. ORDER BY value DESC LIMIT 1 returns
+# id 5. A limit placed before the label filter, ordered by value, would return
+# id 4.
+
+query I
+SELECT count(*)
+FROM (
+    SELECT id, s['label'] AS __datafusion_extracted_1
+    FROM simple_struct
+    WHERE s['value'] > 120
+) t
+WHERE __datafusion_extracted_1 <> 'delta';
+----
+3
+
+query I
+SELECT id
+FROM (
+    SELECT id, s['value'] AS value, s['label'] AS __datafusion_extracted_1
+    FROM simple_struct
+    WHERE s['value'] > 120
+) t
+WHERE __datafusion_extracted_1 <> 'delta'
+ORDER BY value DESC
+LIMIT 1;
+----
+5
 
 statement ok
 set datafusion.explain.logical_plan_only = false;
